@@ -133,10 +133,13 @@ class GenericShareDriver(driver.ExecuteMixin, driver.ShareDriver):
         self.backend_name = self.configuration.safe_get(
             'share_backend_name') or "Cinder_Volumes"
         self.ssh_connections = {}
+        self._setup_service_instance_manager()
+        self.private_storage = kwargs.get('private_storage')
+
+    def _setup_service_instance_manager(self):
         self.service_instance_manager = (
             service_instance.ServiceInstanceManager(
                 driver_config=self.configuration))
-        self.private_storage = kwargs.get('private_storage')
 
     def _ssh_exec(self, server, command):
         connection = self.ssh_connections.get(server['instance_id'])
@@ -480,11 +483,18 @@ class GenericShareDriver(driver.ExecuteMixin, driver.ShareDriver):
         )
 
     def _wait_for_available_volume(self, volume, timeout,
-                                   msg_error, msg_timeout):
+                                   msg_error, msg_timeout,
+                                   expected_size=None):
         t = time.time()
         while time.time() - t < timeout:
             if volume['status'] == const.STATUS_AVAILABLE:
-                break
+                if expected_size and volume['size'] != expected_size:
+                    LOG.debug("The volume %(vol_id)s is available but the "
+                              "volume size does not match the expected size. "
+                              "A volume resize operation may be pending.",
+                              dict(vol_id=volume['id']))
+                else:
+                    break
             if volume['status'] == const.STATUS_ERROR:
                 raise exception.ManilaException(msg_error)
             time.sleep(1)
@@ -568,7 +578,8 @@ class GenericShareDriver(driver.ExecuteMixin, driver.ShareDriver):
         )
         return self._wait_for_available_volume(
             volume, self.configuration.max_time_to_extend_volume,
-            msg_error=msg_error, msg_timeout=msg_timeout
+            msg_error=msg_error, msg_timeout=msg_timeout,
+            expected_size=new_size
         )
 
     def _resize_filesystem(self, server_details, volume):
