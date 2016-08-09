@@ -179,20 +179,32 @@ class WindowsSMBHelperTestCase(test.TestCase):
             self._FAKE_SERVER, self._FAKE_SHARE_LOCATION)
         self.assertEqual([self._FAKE_SHARE], result)
 
-    def test_get_share_path_by_name(self):
-        self._remote_exec.return_value = (self._FAKE_SHARE_LOCATION,
+    @ddt.data({},
+              {'share_exists': False},
+              {'share_exists': False,
+               'ignore_missing': True})
+    def test_get_share_path_by_name(self, ignore_missing=False,
+                                    share_exists=True):
+        share_location = self._FAKE_SHARE_LOCATION if share_exists else None
+        self._remote_exec.return_value = (share_location,
                                           mock.sentinel.std_err)
+        expected_not_found_exc = not share_exists and not ignore_missing
 
-        result = self._win_smb_helper._get_share_path_by_name(
-            mock.sentinel.server,
-            mock.sentinel.share_name)
+        if expected_not_found_exc:
+            self.assertRaises(exception.ShareNotFound,
+                              self._win_smb_helper._get_share_path_by_name,
+                              mock.sentinel.server,
+                              mock.sentinel.share_name)
+        else:
+            result = self._win_smb_helper._get_share_path_by_name(
+                mock.sentinel.server,
+                mock.sentinel.share_name)
+            self.assertEqual(share_location, result)
 
-        cmd = ('Get-SmbShare -Name %s | '
+        cmd = ('Get-SmbShare -Name %s -ErrorAction SilentlyContinue | '
                'Select-Object -ExpandProperty Path' % mock.sentinel.share_name)
         self._remote_exec.assert_called_once_with(mock.sentinel.server,
-                                                  cmd,
-                                                  check_exit_code=True)
-        self.assertEqual(self._FAKE_SHARE_LOCATION, result)
+                                                  cmd)
 
     @mock.patch.object(windows_smb_helper.WindowsSMBHelper,
                        '_get_share_path_by_name')

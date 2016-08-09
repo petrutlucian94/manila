@@ -110,13 +110,15 @@ class WindowsSMBHelper(helpers.NASHelperBase):
 
     def _get_share_path_by_name(self, server, share_name,
                                 ignore_missing=False):
-        cmd = ('Get-SmbShare -Name %s | '
+        cmd = ('Get-SmbShare -Name %s -ErrorAction SilentlyContinue | '
                'Select-Object -ExpandProperty Path' % share_name)
+        (share_path, err) = self._remote_exec(server, cmd)
+        share_path = share_path.strip() if share_path else None
 
-        check_exit_code = not ignore_missing
-        (share_path, err) = self._remote_exec(server, cmd,
-                                              check_exit_code=check_exit_code)
-        return share_path.strip() if share_path else None
+        if not share_path or ignore_missing:
+            raise exception.ShareNotFound(share_id=share_name)
+
+        return share_path
 
     def get_share_path_by_export_location(self, server, export_location):
         share_name = self._get_share_name(export_location)
