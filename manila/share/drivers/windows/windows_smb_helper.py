@@ -13,13 +13,14 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import json
 import os
 
 from oslo_log import log
 
 from manila.common import constants
 from manila import exception
-from manila.i18n import _, _LI
+from manila.i18n import _LI, _LW
 from manila.share.drivers import helpers
 from manila.share.drivers.windows import windows_utils
 
@@ -30,6 +31,23 @@ class WindowsSMBHelper(helpers.NASHelperBase):
     _SHARE_ACCESS_RIGHT_MAP = {
         constants.ACCESS_LEVEL_RW: "Change",
         constants.ACCESS_LEVEL_RO: "Read"}
+
+    _WIN_ACL_ALLOW = 0
+    _WIN_ACL_DENY = 1
+
+    _WIN_ACCESS_RIGHT_FULL = 0
+    _WIN_ACCESS_RIGHT_CHANGE = 1
+    _WIN_ACCESS_RIGHT_READ = 2
+    _WIN_ACCESS_RIGHT_CUSTOM = 3
+
+    _ACCESS_LEVEL_CUSTOM = 'custom'
+
+    _WIN_ACL_MAP = {
+        _WIN_ACCESS_RIGHT_CHANGE: constants.ACCESS_LEVEL_RW,
+        _WIN_ACCESS_RIGHT_FULL: constants.ACCESS_LEVEL_RW,
+        _WIN_ACCESS_RIGHT_READ: constants.ACCESS_LEVEL_RO,
+        _WIN_ACCESS_RIGHT_CUSTOM: _ACCESS_LEVEL_CUSTOM,
+    }
 
     def __init__(self, remote_execute, configuration):
         self._remote_exec = remote_execute
@@ -68,16 +86,54 @@ class WindowsSMBHelper(helpers.NASHelperBase):
             server, share_path)
         return volume_path
 
-    def allow_access(self, server, share_name, access_type, access_level,
-                     access_to):
-        """Add access for share."""
-        if access_type != 'user':
-            reason = _('Only user access type allowed.')
-            raise exception.InvalidShareAccess(reason=reason)
+    def _get_acls(self, server, share_name):
+        cmd = ('Get-SmbShareAccess -Name %(share_name)s | '
+               'Select-Object @("Name", "AccountName", '
+               '"AccessControlType", "AccessRight") | '
+               'ConvertTo-JSON -Compress')
+        (out, err) = self._remote_cmd(server, cmd)
 
-        self._grant_share_access(server, share_name, access_level, access_to)
+        raw_acls = json.loads(out)
+        return raw_acls
+
+    def get_access_rules(self, server, share_name):
+        raw_acls = self._get_acls(server, share_name)
+        acls = []
+
+        for raw_acl in raw_acls:
+            access_to = raw_acl['AccountName']
+            access_level = self._WIN_ACL_MAP[raw_acl['AccessRight']]
+            access_allow = raw_acl["AccessControlType"] == self._WIN_ACL_ALLOW
+
+            if not access_allow:
+                if access_to.lower() == 'everyone' and len(raw_acls) == 1:
+                    LOG.debug("No access rules are set yet for share %s",
+                              share_name)
+                else:
+                    LOG.warning(
+                        _LW("Found explicit deny ACE rule that was not "
+                            "created by Manila and will be ignored: %s"),
+                        raw_acl)
+                continue
+            if access_level == self._ACCESS_LEVEL_CUSTOM:
+                LOG.warning(
+                    _LW("Found 'custom' ACE rule that will be ignored: %s"),
+                    raw_acl)
+                continue
+
+            acl = dict(access_to=access_to,
+                       access_level=access_level,
+                       access_type='user')
+            acls.append(acl)
+        return acls
 
     def _grant_share_access(self, server, share_name, access_level, access_to):
+        LOG.info(_LI("Granting %(access_level)s acess to %(acess_to)s "
+                     "on share %(share_name)s"),
+                 dict(access_level=access_level,
+                      acess_to=access_to,
+                      share_name=share_name))
+
         access_right = self._SHARE_ACCESS_RIGHT_MAP[access_level]
         cmd = ["Grant-SmbShareAccess", "-Name", share_name,
                "-AccessRight", access_right,
@@ -89,15 +145,56 @@ class WindowsSMBHelper(helpers.NASHelperBase):
         cmd = ['Set-SmbPathAcl', '-ShareName', share_name]
         self._remote_exec(server, cmd)
 
-    def deny_access(self, server, share_name, access, force=False):
-        access_to = access['access_to']
-        self._revoke_share_access(server, share_name, access_to)
-
     def _revoke_share_access(self, server, share_name, access_to):
+        LOG.info(_LI("Revoking acess to %(acess_to)s "
+                     "on share %(share_name)s"),
+                 dict(acess_to=access_to,
+                      share_name=share_name))
+
         cmd = ['Revoke-SmbShareAccess', '-Name', share_name,
                '-AccountName', access_to, '-Force']
         self._remote_exec(server, cmd)
         self._refresh_acl(server, share_name)
+
+    def update_access(self, server, share_name, access_rules, add_rules,
+                      delete_rules):
+        all_rules = [access_rules, add_rules, delete_rules]
+        self.validate_access_rules(
+            all_rules, ('user',),
+            (constants.ACCESS_LEVEL_RO, constants.ACCESS_LEVEL_RW))
+
+        if not (add_rules or delete_rules):
+            existing_rules = self.get_access_rules(server, share_name)
+            (add_rules,
+             delete_rules) = self._get_rule_updates(existing_rules,
+                                                    access_rules)
+        for added_rule in add_rules:
+            self._grant_share_access(server, share_name,
+                                     added_rule['access_type'],
+                                     added_rule['access_level'],
+                                     added_rule['access_to'])
+
+        for deleted_rule in delete_rules:
+            self._revoke_share_access(server, share_name,
+                                      deleted_rule['access_to'])
+
+    def _subtract_access_rules(self, access_rules, subtracted_rules):
+        # Account names are case insensitive on Windows.
+        filter_rules = lambda rules: set(
+            dict(access_to=access_rule['access_to'].lower(),
+                 access_level=access_rule['access_level'],
+                 access_type=access_rule['access_type'])
+            for access_rule in rules)
+
+        return filter_rules(access_rules).difference(
+            filter_rules(subtracted_rules))
+
+    def _get_rule_updates(self, existing_rules, requested_rules):
+        added_rules = self._subtract_access_rules(requested_rules,
+                                                  existing_rules)
+        deleted_rules = self._subtract_access_rules(existing_rules,
+                                                    requested_rules)
+        return added_rules, deleted_rules
 
     def _get_share_name(self, export_location):
         return self._windows_utils.normalize_path(
